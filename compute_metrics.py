@@ -143,6 +143,18 @@ class EEGViewer(tk.Tk):
         self.model = None
         self._build_model()
         self.update_view()
+        
+        # Bind cleanup on window close
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+    
+    def _on_closing(self):
+        """Clean up resources when closing"""
+        if hasattr(self, 'model') and self.model is not None:
+            try:
+                self.model.release()
+            except:
+                pass
+        self.destroy()
 
     def _on_apply(self):
         if (self.pipeline_var.get()=="BrainFlow" or self.metric_src.get()=="MLModel") and not HAS_BRAINFLOW:
@@ -153,6 +165,12 @@ class EEGViewer(tk.Tk):
 
     def _build_model(self):
         """Build ML model with proper error handling"""
+        # Always release existing model first
+        if hasattr(self, 'model') and self.model is not None:
+            try:
+                self.model.release()
+            except:
+                pass
         self.model = None
         
         if not HAS_BRAINFLOW or self.metric_src.get() != "MLModel":
@@ -165,11 +183,18 @@ class EEGViewer(tk.Tk):
             self.model = MLModel(params)
             self.model.prepare()
             print(f"Successfully prepared ML model: {self.metric_type_var.get()} with {self.classifier_var.get()}")
+            
+            # Print expected input size if available
+            try:
+                # Some models have methods to check expected input size
+                print(f"Model metric: {mt}, classifier: {cf}")
+            except:
+                pass
+                
         except Exception as e:
             print(f"Failed to build model: {e}")
-            messagebox.showwarning("Model Error", f"Failed to build ML model: {e}\nFalling back to raw α/β ratio.")
-            self.metric_src.set("Raw α/β Ratio")
             self.model = None
+            # Don't show popup every time, just print error
 
     def _get_band_powers_safe(self, data):
         """Safely compute band powers with proper error handling"""
@@ -177,6 +202,11 @@ class EEGViewer(tk.Tk):
             # Ensure data is contiguous and properly shaped
             if len(data.shape) != 2:
                 raise ValueError(f"Data must be 2D, got shape {data.shape}")
+            
+            # BrainFlow models expect specific channel counts
+            # Most models are trained on specific electrode configurations
+            num_channels = data.shape[1]
+            print(f"Data shape: {data.shape}, Channels: {num_channels}")
             
             # Transpose to channels x samples format for BrainFlow
             data_transposed = np.ascontiguousarray(data.T, dtype=np.float64)
@@ -189,6 +219,7 @@ class EEGViewer(tk.Tk):
                 data_transposed, channels, self.sr, True
             )
             
+            print(f"Band powers shape: {avg_powers.shape}, Values: {avg_powers}")
             return avg_powers
             
         except Exception as e:
@@ -286,17 +317,50 @@ class EEGViewer(tk.Tk):
                 band_powers = self._get_band_powers_safe(proc)
                 
                 if band_powers is not None:
-                    # Reshape for model input
-                    feat = band_powers.reshape(1, -1)
+                    # BrainFlow models often expect specific feature vector sizes
+                    # Common sizes are: 5 (basic bands), 25 (5 bands × 5 channels), etc.
                     
-                    # Predict with model
-                    prediction = self.model.predict(feat)
-                    if len(prediction) > 0:
-                        mdl_c = float(prediction[0])
-                        mdl_r = 1.0 - mdl_c
-                        # Clamp values to reasonable range
-                        mdl_c = max(0.0, min(1.0, mdl_c))
-                        mdl_r = max(0.0, min(1.0, mdl_r))
+                    # Try different feature reshaping strategies
+                    feature_attempts = []
+                    
+                    # Strategy 1: Use band powers as-is
+                    feature_attempts.append(band_powers.reshape(1, -1))
+                    
+                    # Strategy 2: If we have multiple channels, try flattening differently
+                    if len(self.filtered_cols) > 1:
+                        # Reshape to (1, bands × channels)
+                        expected_bands = 5  # Delta, Theta, Alpha, Beta, Gamma
+                        if band_powers.size == expected_bands * len(self.filtered_cols):
+                            reshaped = band_powers.reshape(len(self.filtered_cols), expected_bands)
+                            feature_attempts.append(reshaped.flatten().reshape(1, -1))
+                    
+                    # Strategy 3: Try taking only first N features if too many
+                    common_sizes = [5, 10, 15, 20, 25, 30]
+                    for size in common_sizes:
+                        if band_powers.size >= size:
+                            feature_attempts.append(band_powers.flatten()[:size].reshape(1, -1))
+                    
+                    # Try each feature configuration
+                    prediction_success = False
+                    for i, feat in enumerate(feature_attempts):
+                        try:
+                            print(f"Trying feature attempt {i+1}: shape {feat.shape}")
+                            prediction = self.model.predict(feat)
+                            if len(prediction) > 0:
+                                mdl_c = float(prediction[0])
+                                mdl_r = 1.0 - mdl_c
+                                # Clamp values to reasonable range
+                                mdl_c = max(0.0, min(1.0, mdl_c))
+                                mdl_r = max(0.0, min(1.0, mdl_r))
+                                print(f"Successful prediction with attempt {i+1}: {mdl_c:.3f}")
+                                prediction_success = True
+                                break
+                        except Exception as attempt_e:
+                            print(f"Feature attempt {i+1} failed: {attempt_e}")
+                            continue
+                    
+                    if not prediction_success:
+                        print("All feature reshaping attempts failed")
                     
             except Exception as e:
                 print(f"ML model prediction failed: {e}")

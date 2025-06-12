@@ -14,7 +14,7 @@ from brainflow.data_filter import (
 
 # ─── 1. LOAD RAW DATA ─────────────────────────────────────────────────────
 
-FILENAME = r"C:\Users\DELL\Documents\OpenBCI_GUI\Recordings\OpenBCISession_2025-05-30_15-23-14\concentration1sub2.txt"
+FILENAME = r"C:\Users\DELL\Documents\OpenBCI_GUI\Recordings\OpenBCISession_2025-05-30_15-23-14\concentration 2sub1.txt"
 FS = 250
 
 df = pd.read_csv(FILENAME, comment='%', skipinitialspace=True, low_memory=False)
