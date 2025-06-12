@@ -184,27 +184,20 @@ class EEGViewer(tk.Tk):
             self.model.prepare()
             print(f"Successfully prepared ML model: {self.metric_type_var.get()} with {self.classifier_var.get()}")
             
-            # Print expected input size if available
-            try:
-                # Some models have methods to check expected input size
-                print(f"Model metric: {mt}, classifier: {cf}")
-            except:
-                pass
-                
         except Exception as e:
             print(f"Failed to build model: {e}")
             self.model = None
-            # Don't show popup every time, just print error
 
-    def _get_band_powers_safe(self, data):
-        """Safely compute band powers with proper error handling"""
+    def _get_brainflow_feature_vector(self, data):
+        """
+        Create feature vector using BrainFlow's expected format.
+        Based on BrainFlow documentation: feature_vector = np.concatenate((bands[0], bands[1]))
+        """
         try:
             # Ensure data is contiguous and properly shaped
             if len(data.shape) != 2:
                 raise ValueError(f"Data must be 2D, got shape {data.shape}")
             
-            # BrainFlow models expect specific channel counts
-            # Most models are trained on specific electrode configurations
             num_channels = data.shape[1]
             print(f"Data shape: {data.shape}, Channels: {num_channels}")
             
@@ -214,16 +207,23 @@ class EEGViewer(tk.Tk):
             # Get channel indices
             channels = list(range(data_transposed.shape[0]))
             
-            # Compute average band powers
-            avg_powers, _ = DataFilter.get_avg_band_powers(
+            # Get band powers - this returns TWO arrays that need to be concatenated
+            avg_band_powers, std_band_powers = DataFilter.get_avg_band_powers(
                 data_transposed, channels, self.sr, True
             )
             
-            print(f"Band powers shape: {avg_powers.shape}, Values: {avg_powers}")
-            return avg_powers
+            print(f"Avg band powers shape: {avg_band_powers.shape}, Values: {avg_band_powers}")
+            print(f"Std band powers shape: {std_band_powers.shape}, Values: {std_band_powers}")
+            
+            # THIS IS THE KEY FIX: Concatenate both arrays as shown in BrainFlow docs
+            feature_vector = np.concatenate((avg_band_powers, std_band_powers))
+            
+            print(f"Feature vector shape: {feature_vector.shape}, Values: {feature_vector}")
+            
+            return feature_vector
             
         except Exception as e:
-            print(f"Error computing band powers: {e}")
+            print(f"Error creating BrainFlow feature vector: {e}")
             return None
 
     def update_view(self, *args):
@@ -307,60 +307,39 @@ class EEGViewer(tk.Tk):
         raw_r = alpha/(alpha+beta+1e-6)
         mdl_c = mdl_r = None
         
-        # Try ML model prediction with better error handling
+        # Try ML model prediction with corrected feature vector
         if (self.model and 
             self.pipeline_var.get() == "BrainFlow" and 
             self.metric_src.get() == "MLModel"):
             
             try:
-                # Get band powers using BrainFlow
-                band_powers = self._get_band_powers_safe(proc)
+                # Get properly formatted feature vector
+                feature_vector = self._get_brainflow_feature_vector(proc)
                 
-                if band_powers is not None:
-                    # BrainFlow models often expect specific feature vector sizes
-                    # Common sizes are: 5 (basic bands), 25 (5 bands × 5 channels), etc.
+                if feature_vector is not None:
+                    print(f"Attempting prediction with feature vector shape: {feature_vector.shape}")
+                    prediction = self.model.predict(feature_vector)
                     
-                    # Try different feature reshaping strategies
-                    feature_attempts = []
-                    
-                    # Strategy 1: Use band powers as-is
-                    feature_attempts.append(band_powers.reshape(1, -1))
-                    
-                    # Strategy 2: If we have multiple channels, try flattening differently
-                    if len(self.filtered_cols) > 1:
-                        # Reshape to (1, bands × channels)
-                        expected_bands = 5  # Delta, Theta, Alpha, Beta, Gamma
-                        if band_powers.size == expected_bands * len(self.filtered_cols):
-                            reshaped = band_powers.reshape(len(self.filtered_cols), expected_bands)
-                            feature_attempts.append(reshaped.flatten().reshape(1, -1))
-                    
-                    # Strategy 3: Try taking only first N features if too many
-                    common_sizes = [5, 10, 15, 20, 25, 30]
-                    for size in common_sizes:
-                        if band_powers.size >= size:
-                            feature_attempts.append(band_powers.flatten()[:size].reshape(1, -1))
-                    
-                    # Try each feature configuration
-                    prediction_success = False
-                    for i, feat in enumerate(feature_attempts):
-                        try:
-                            print(f"Trying feature attempt {i+1}: shape {feat.shape}")
-                            prediction = self.model.predict(feat)
-                            if len(prediction) > 0:
-                                mdl_c = float(prediction[0])
-                                mdl_r = 1.0 - mdl_c
-                                # Clamp values to reasonable range
-                                mdl_c = max(0.0, min(1.0, mdl_c))
-                                mdl_r = max(0.0, min(1.0, mdl_r))
-                                print(f"Successful prediction with attempt {i+1}: {mdl_c:.3f}")
-                                prediction_success = True
-                                break
-                        except Exception as attempt_e:
-                            print(f"Feature attempt {i+1} failed: {attempt_e}")
-                            continue
-                    
-                    if not prediction_success:
-                        print("All feature reshaping attempts failed")
+                    if len(prediction) > 0:
+                        # BrainFlow only has MINDFULNESS and RESTFULNESS metrics
+                        if self.metric_type_var.get() == "MINDFULNESS":
+                            mdl_c = float(prediction[0])  # Use mindfulness as concentration
+                            mdl_r = 1.0 - mdl_c  # Approximate relaxation as inverse
+                        elif self.metric_type_var.get() == "RESTFULNESS":
+                            mdl_r = float(prediction[0])  # Use restfulness as relaxation
+                            mdl_c = 1.0 - mdl_r  # Approximate concentration as inverse
+                        else:
+                            # For USER_DEFINED or other metrics
+                            mdl_c = float(prediction[0])
+                            mdl_r = 1.0 - mdl_c
+                        
+                        # Clamp values to reasonable range
+                        if mdl_c is not None:
+                            mdl_c = max(0.0, min(1.0, mdl_c))
+                        if mdl_r is not None:
+                            mdl_r = max(0.0, min(1.0, mdl_r))
+                        
+                        print(f"Successful prediction - Concentration: {mdl_c:.3f}, Relaxation: {mdl_r:.3f}")
                     
             except Exception as e:
                 print(f"ML model prediction failed: {e}")
